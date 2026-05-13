@@ -1,37 +1,34 @@
 """
-head_init.py — Final layer initialization (student-implemented).
+head_init.py — Xavier + small-scale initialization for the 100-class head.
 
-Students: Implement `init_last_layer` to control how the new classification
-head is initialized before fine-tuning begins. The skeleton below uses
-Kaiming uniform weights and zero bias — you are expected to experiment with
-alternatives (e.g. Xavier, orthogonal, small-scale random, learned bias init).
+Xavier uniform preserves gradient variance across layers, which is preferred
+over Kaiming when the activation before the head is not ReLU. The small weight
+scale (0.1x) prevents large initial logits that would produce a flat softmax
+and a high initial loss — giving the ZO optimizer a better-shaped loss surface
+to navigate from the first step.
 """
 
 import torch
 import torch.nn as nn
+import math
 
 
 def init_last_layer(layer: nn.Linear) -> None:
-    """Initialize the weights and bias of the final classification layer in-place.
+    """Initialize the 100-class CIFAR100 classification head.
 
-    This function is called once during model construction (see model.py).
-    Modify it to experiment with different initialization strategies and observe
-    their effect on the "initialized head" evaluation checkpoint.
+    Strategy:
+        - Xavier uniform weights scaled by 0.1 for a conservative start.
+          Large initial weights → near-uniform softmax → high cross-entropy
+          loss plateau that ZO methods struggle to escape.
+        - Bias initialized to log(1/C) = log(1/100) ≈ -4.6 to match the
+          uniform class prior, giving a well-calibrated starting point.
 
     Args:
-        layer: The ``nn.Linear`` layer that serves as the new CIFAR100 head.
-               Modifies the layer in-place; return value is ignored.
-
-    Student task:
-        Replace or extend the skeleton below. Some strategies to consider:
-          - ``nn.init.xavier_uniform_``  — preserves variance across layers
-          - ``nn.init.orthogonal_``      — encourages diverse feature directions
-          - Small-scale init (e.g. scale weights by 0.01) — conservative start
-          - Non-zero bias init           — useful when class priors are known
+        layer: The nn.Linear layer to initialize in-place.
     """
-    # -------------------------------------------------------------------------
-    # STUDENT: Replace or extend the initialization below.
-    # -------------------------------------------------------------------------
-    nn.init.kaiming_uniform_(layer.weight, nonlinearity="relu")
-    nn.init.zeros_(layer.bias)
-    # -------------------------------------------------------------------------
+    nn.init.xavier_uniform_(layer.weight)
+    layer.weight.data.mul_(0.1)  # conservative scale
+
+    # Bias = log(uniform prior) for calibrated initial predictions
+    num_classes = layer.out_features
+    nn.init.constant_(layer.bias, math.log(1.0 / num_classes))
