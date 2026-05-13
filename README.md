@@ -1,161 +1,153 @@
-# SMILES-2026 Application Solution: Zero-Order Fine-Tuning of ResNet18
+# Zero-Order Fine-Tuning of ResNet18 on CIFAR100
 
-## Reproducibility Instructions
+## Assignment Overview
 
-### Environment
+In this assignment you will fine-tune a pretrained ResNet18 on the CIFAR100 dataset using **zero-order (gradient-free) optimization** — i.e. without computing any gradients explicitly. Your optimizer may only query the model as a black box, receiving scalar loss values in return.
+
+The total compute budget is fixed in terms of **samples**: you get exactly `n_batches` optimizer steps, each operating on a mini-batch of size `batch_size`. The total number of samples used must not exceed **8192** (`n_batches × batch_size ≤ 8192`). Choose your split wisely — more steps means finer updates, larger batches means less noisy loss estimates. 
+
+**The goal is to achieve the best possible validation accuracy within the compute budget.**
+
+You are free to edit the following files:
+
+- `zo_optimizer.py`
+- `head_init.py`
+- `augmentation.py`
+- `train_data.py`
+
+---
+
+## Quick Start
+
+### 1. Install dependencies
 
 ```bash
-python >= 3.9
-pip install torch torchvision tqdm
+pip install -r requirements.txt
 ```
 
-The solution has no additional dependencies beyond the provided `requirements.txt`.
-
-### Run
+### 2. Run evaluation
 
 ```bash
 python validate.py \
     --data_dir ./data \
-    --batch_size 64 \
-    --n_batches 128 \
+    --batch_size 32 \
+    --n_batches 32 \
     --output results.json
 ```
 
-CIFAR100 is downloaded automatically to `--data_dir` on first run.  
-Total compute budget: `128 × 64 = 8192` samples (maximum allowed).
+CIFAR100 will be downloaded automatically to `--data_dir` on the first run.
+
+> **Compute budget constraint:** `n_batches × batch_size` must not exceed **8192**. `validate.py` enforces this at startup and will exit with an error if the limit is exceeded. Valid combinations include `32 × 32`, `64 × 16`, or `128 × 8`. Consider the trade-off: more batches allow more optimizer steps, larger batches reduce gradient estimate noise.
 
 ---
 
-## Final Solution Description
+## Files You Can Edit
 
-### Overview
+| File | What to implement |
+|------|-------------------|
+| `zo_optimizer.py` | Gradient estimator, parameter update rule, and layer selection strategy |
+| `augmentation.py` | Training-time data augmentation pipeline |
+| `head_init.py` | Weight initialization for the new classification head |
+| `train_data.py` | Train dataset and dataloader initialization |
 
-I implemented three interlocking improvements over the skeleton: a better gradient estimator (SPSA), an adaptive optimizer (Adam), and a curriculum that controls which parameters are trained and when.
-
-### 1. SPSA Gradient Estimator (`zo_optimizer.py`)
-
-The skeleton uses a **per-parameter central-difference estimator**, which requires `2N` forward passes for `N` parameters. For a ResNet18 fc layer alone (`512 × 100 + 100 = 51,300` parameters), this would mean 102,600 forward passes per step — far exceeding the compute budget.
-
-I replaced it with **SPSA (Simultaneous Perturbation Stochastic Approximation)**, which perturbs *all* active parameters simultaneously with a single Rademacher direction vector:
-
-```
-Δ_i ∈ {+1, −1}  with equal probability  (Rademacher distribution)
-
-g_i ≈ [f(x + ε·Δ) − f(x − ε·Δ)] / (2ε·Δ_i)
-     = [f(x + ε·Δ) − f(x − ε·Δ)] / (2ε) · Δ_i   (since Δ_i ∈ {±1})
-```
-
-This requires exactly **2 forward passes per step** regardless of parameter count. The estimator is unbiased and its variance is independent of dimensionality — a crucial property that makes SPSA scalable.
-
-**Why Rademacher over Gaussian?** Rademacher directions give lower-variance estimates for the same number of samples, because each element has the same magnitude (no lucky/unlucky draws). This is the standard choice in the SPSA literature (Spall, 1992).
-
-### 2. Adam Update Rule (`zo_optimizer.py`)
-
-The skeleton uses vanilla SGD: `θ ← θ − lr·g`. SPSA gradients are inherently noisy (single-sample estimates). Vanilla SGD with noisy gradients produces erratic updates.
-
-I replaced it with **Adam** (Kingma & Ba, 2014):
-
-```
-m ← β₁·m + (1−β₁)·g          # first moment (EMA of gradients)
-v ← β₂·v + (1−β₂)·g²         # second moment (EMA of squared gradients)
-θ ← θ − lr · m̂ / (√v̂ + ε)    # bias-corrected update
-```
-
-Adam's per-parameter adaptive learning rates allow large updates on rarely-activated features (some fc neurons) and small updates on frequently-updated features, which is especially valuable with a noisy SPSA estimator. In practice, this gave ~15% faster convergence over SGD in preliminary experiments.
-
-**Hyperparameters:** `lr=0.01`, `β₁=0.9`, `β₂=0.999`, `ε=1e-8` (standard Adam defaults).
-
-### 3. Curriculum Layer Selection (`zo_optimizer.py`)
-
-**Phase 1 (steps 0–59): Head only** (`fc.weight`, `fc.bias`)  
-The classification head is randomly initialized and accounts for all classification error at the start. Optimizing it first gives the model a working linear probe before touching backbone features. With SPSA, tuning the head (51,300 params) is cheap and converges well.
-
-**Phase 2 (steps 60+): Head + layer4 BatchNorm**  
-After head convergence, I unlock the **BatchNorm** scale/shift parameters (`γ`, `β`) in the final residual block (10 tensors, 512 parameters each, ~5,120 total). BN adaptation is a well-known and highly effective technique for transfer learning: it recalibrates the feature distribution to the target domain (CIFAR100) without touching the learned conv filters. Because BN params are small vectors (not 512×512 weight matrices), SPSA's variance remains manageable.
-
-I deliberately **do not** tune the large conv weight tensors in layer4. Perturbing a `512×512×3×3` weight matrix (~2.36M params) with SPSA produces near-zero gradient signal — the signal-to-noise ratio collapses for high-dimensional perturbations, making the estimate useless.
-
-### 4. Head Initialization (`head_init.py`)
-
-I replaced Kaiming uniform with **Xavier uniform scaled by 0.1**:
-
-```python
-nn.init.xavier_uniform_(layer.weight)
-layer.weight.data.mul_(0.1)
-nn.init.constant_(layer.bias, math.log(1.0 / num_classes))
-```
-
-**Xavier** preserves gradient variance between layers, which is more appropriate than Kaiming when the preceding activation is not a strict ReLU (ResNet's final average pool has no activation).
-
-**Scale-down by 0.1** prevents large initial logits that cause a flat softmax and a high initial cross-entropy plateau. ZO methods struggle to descend from a flat plateau because all perturbations give similar loss values. A well-scaled initialization gives a steeper loss landscape from step 1.
-
-**Bias = log(1/100) ≈ −4.6** matches the uniform prior over 100 classes, producing a well-calibrated baseline before any optimization.
-
-### 5. Augmentation (`augmentation.py`)
-
-The training pipeline adds, in order:
-- `Resize(232)` → `RandomCrop(224)`: translation invariance without information loss at edges
-- `RandomHorizontalFlip()`: standard for natural images
-- `RandomRotation(15°)`: moderate rotational invariance
-- `ColorJitter(0.3, 0.3, 0.2, 0.05)`: robustness to the varied lighting conditions across CIFAR100 superclasses
-- `RandomErasing(p=0.2)`: occlusion robustness, reduces texture overfitting
-
-These improve generalization at test time, making the linear probe trained by ZO more robust.
+**Do not edit** `validate.py` or `model.py`. These are fixed infrastructure and will be replaced with the original versions during grading.
 
 ---
 
-## Empirical Findings and Tuning Process
+## What to Implement
 
-### Key finding: SPSA variance scales badly with parameter dimension
+### `zo_optimizer.py` — Zero-order optimizer (main task)
 
-The central empirical result of this project is that **SPSA's gradient signal
-degrades rapidly as the number of active parameters grows**. With a single
-random perturbation direction, the finite-difference scalar
-`(f+ - f-) / 2ε` must encode information about ALL active parameters
-simultaneously. When the parameter space is large, the projection onto
-any single direction becomes negligible relative to noise.
+This is the core of the assignment. Your optimizer must:
 
-Concretely:
+- Estimate pseudo-gradients using only scalar loss evaluations — no `loss.backward()` calls are permitted
+- Update only the parameters you select via `self.layer_names`
+- Respect the compute budget — every call to `loss_fn()` inside `.step()` costs one forward pass
 
-| Active parameters | Params (approx) | Observed behaviour |
-|---|---|---|
-| `fc.weight` + `fc.bias` | 51,300 | Loss oscillates, no improvement |
-| `fc.bias` only (large batch) | 100 | Loss decreases, accuracy improves |
+The skeleton provides a **2-point central-difference estimator** as a starting point:
 
-### Batch size matters as much as parameter count
+```
+grad ≈ (f(x + ε·u) - f(x - ε·u)) / (2ε)  ×  u
+```
 
-With 100 output classes, a batch of 64 provides fewer than 1 sample per
-class on average. Cross-entropy loss on such a batch is dominated by
-sampling noise rather than class structure. Increasing to batch=256 gives
-~2.5 samples per class, making the SPSA scalar meaningfully correlated
-with true class separability.
+where `u` is a random unit vector. This requires 2 forward passes **per parameter**, which becomes prohibitively expensive for large layers. Consider replacing it with **SPSA** (Simultaneous Perturbation Stochastic Approximation), which uses only 2 forward passes regardless of model size by perturbing all parameters simultaneously.
 
-### Final working configuration
+You also control **which layers to tune** via `self.layer_names`. This list can be changed between steps, enabling curriculum strategies — for example, optimizing only the head early on, then gradually unfreezing deeper layers as the budget allows.
 
-- **Active parameters:** `fc.bias` (100 scalars)
-- **Batch size:** 256, **Steps:** 32 (budget: 8,192 samples)
-- **Optimizer:** SPSA + Adam, `lr=0.01`, `eps=0.01`
-- **Result:** Accuracy improves from 1.21% (initialized) → 1.29% (fine-tuned)
+### `augmentation.py` — Data augmentation
 
-### Why this is meaningful
+Extend the training transform pipeline to improve generalization. The skeleton includes resize, random horizontal flip, and normalization with CIFAR100 statistics. Useful additions to consider:
 
-A 6.6% relative improvement over the initialized head demonstrates that
-even 32 ZO steps on 100 parameters can produce a statistically
-distinguishable signal under the given budget. The result confirms the
-theoretical expectation: SPSA is most effective when (a) the active
-parameter set is low-dimensional, and (b) the loss function provides
-a consistent signal across the batch.
+- `T.RandomCrop(224, padding=28)` — translation invariance
+- `T.ColorJitter(...)` — colour robustness
+- `T.RandomErasing(p=0.2)` — occlusion robustness
 
-### What would improve results further
+Do **not** modify the validation transforms.
 
-- **GPU access:** Would allow larger batches (512–1024) and more steps
-- **Partial gradient projection:** Project SPSA onto a low-rank subspace
-  of `fc.weight` rather than skipping it entirely
-- **More steps:** With unlimited budget, BN adaptation (layer4) would
-  help significantly as shown in preliminary experiments
+### `head_init.py` — Head initialization
 
-  ---
+Implement `init_last_layer(layer)` to initialize the new 100-class linear head. The skeleton uses Kaiming uniform initialization. Alternatives worth exploring:
 
-## Connection to Robotics Research
+- `nn.init.xavier_uniform_` — variance-preserving across layers
+- `nn.init.orthogonal_` — encourages diverse feature directions
+- Small-scale initialization (e.g. multiply weights by 0.01) — conservative starting point that avoids large initial loss values
 
-Zero-order optimization is directly relevant to robotics. In sim-to-real transfer, policy optimization, and scenarios where the system is a black box (hardware-in-the-loop, non-differentiable physics), gradient-free methods like SPSA are often the only option. The curriculum strategy implemented here mirrors progressive fine-tuning strategies used in robot learning, where one first adapts high-level task-relevant layers before adjusting lower-level representations.
+### `train_data.py` — Train data
+
+You may control which training samples are used — you can select a fixed subset, sample randomly from CIFAR100, or even generate synthetic data.
+
+---
+
+## Evaluation Checkpoints
+
+`validate.py` runs three evaluations in sequence and reports top-1 accuracy on the CIFAR100 validation set (10,000 images).
+
+| # | Checkpoint | What it measures |
+|---|-----------|-----------------|
+| 1 | **Baseline (ImageNet head)** | Raw transfer performance of ResNet18 with the original 1000-class ImageNet head applied to CIFAR100. Accuracy will be near zero since the output classes do not match — this is a sanity check only. |
+| 2 | **Initialized head (no fine-tuning)** | Performance after replacing the head with your 100-class layer, initialized via `init_last_layer()`, with no optimization. Reflects the quality of your initialization strategy. |
+| 3 | **Fine-tuned (ZO)** | Accuracy after `n_batches` zero-order optimization steps. This is your primary result and the number used for grading. |
+
+The gap between checkpoint 2 and checkpoint 3 reflects the effectiveness of your optimizer. The level of checkpoint 2 reflects the quality of your head initialization.
+
+---
+
+## Output JSON
+
+Results are saved to the path specified by `--output`. Example:
+
+```json
+{
+  "val_accuracy_imagenet_head": 0.0412,
+  "val_accuracy_init_head": 0.0091,
+  "val_accuracy_finetuned": 0.1735,
+  "n_batches": 32,
+  "batch_size": 32,
+  "layers_tuned": ["fc.weight", "fc.bias"],
+  "total_samples": 1024
+}
+```
+
+All accuracy values are in `[0, 1]` — multiply by 100 for percentages. Top-1 accuracy on the fine-tuned checkpoint is the sole metric used for grading.
+
+**`val_accuracy_top1_finetuned` is our main metric for this assignment.**
+
+# What is expected from the applicant of SMILES-2026 ?
+
+**Q1:** What must the applicant submit in the application form ?<br>
+**A1:** Submit: 
+1. A link to your Github repository
+
+**Q2:** What the applicants must include in the Github repository ?<br>
+**A2:** Your repository must contain: 
+1. `results.json` - produced by the official `validate.py`
+2. Report file in Markdown format `SOLUTION.md`. 
+
+**Q3:** Report requirements (`SOLUTION.md`)<br>
+**A3:** Your report must include:
+- Reproducibility instructions: exact commands to run your solution and acquire the same `results.json`, required environment (if any), any important implementation details needed to reproduce your result.
+- Final solution description: What components you modified ? What your final approach is ? Why you made these choices ? What contributed most to improving the metric ?
+- Experiments and failed attempts: What ideas you tried but did not include in the final solution ? Why they did not work or were discarded ?
+
+**Q4:** Reproducibility<br>
+**A4:** The repository must be self-contained and runnable with the provided `validate.py` evaluation script. Your solution must not require changes to the fixed files. Running `validate.py` must generate your final `results.json`. The reported metric (`val_accuracy_top1_finetuned`) in `results.json` must be reproducible using the official evaluation script. A deviation of up to ±0.5% (absolute accuracy) is allowed.
