@@ -30,7 +30,7 @@ _LAYER4_BN_PARAMS = [
     "layer4.1.bn2.weight", "layer4.1.bn2.bias",
 ]
 
-_PHASE2_STEP = 60
+_PHASE2_STEP = 9999
 
 
 class ZeroOrderOptimizer:
@@ -46,8 +46,8 @@ class ZeroOrderOptimizer:
     def __init__(
         self,
         model: nn.Module,
-        lr: float = 1e-3,
-        eps: float = 1e-2,
+        lr: float = 5e-4,
+        eps: float = 5e-3,
         perturbation_mode: str = "rademacher",
         beta1: float = 0.9,
         beta2: float = 0.999,
