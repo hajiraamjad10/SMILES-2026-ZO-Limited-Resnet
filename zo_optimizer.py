@@ -46,8 +46,8 @@ class ZeroOrderOptimizer:
     def __init__(
         self,
         model: nn.Module,
-        lr: float = 5e-4,
-        eps: float = 5e-3,
+        lr: float = 1e-2,
+        eps: float = 1e-2,
         perturbation_mode: str = "rademacher",
         beta1: float = 0.9,
         beta2: float = 0.999,
@@ -63,7 +63,7 @@ class ZeroOrderOptimizer:
         self.step_count: int = 0
         self._m: dict[str, torch.Tensor] = {}
         self._v: dict[str, torch.Tensor] = {}
-        self.layer_names: list[str] = ["fc.weight", "fc.bias"]
+        self.layer_names: list[str] = ["fc.bias"]
 
     def _active_params(self) -> dict[str, nn.Parameter]:
         named = dict(self.model.named_parameters())
